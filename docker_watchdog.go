@@ -217,7 +217,7 @@ func (dm *DependencyManager) scanContainers() error {
 				log.Printf("New child container detected: %s -> %s",
 					dm.getContainerName(actualParentID), dm.getContainerName(c.ID))
 			} else {
-				// Update current running state if container exists (only if it's actually running)
+				// Update running state if container is running (never overwrite with false)
 				isRunning := c.State == "running"
 				if isRunning {
 					dm.childStates[c.ID].WasRunning = true
@@ -233,12 +233,13 @@ func (dm *DependencyManager) scanContainers() error {
 		}
 	}
 
-	// Check for missing parents and stop their children BEFORE updating dependencies
-	// This must run first so it can see old parent IDs in dm.dependencies
-	dm.handleMissingParents()
-	
-	// Check for recreated parents BEFORE updating dependencies (so we still have the old ones)
+	// IMPORTANT: Check for recreated parents FIRST - before stopping anything
+	// This way we know which parents are being recreated and won't stop their children
 	dm.handleRecreatedParents()
+	
+	// Check for missing parents and stop their children if they are NOT being recreated
+	// This must run after handleRecreatedParents so we know which parents were recreated
+	dm.handleMissingParents()
 	
 	// Remove all non-existing parent IDs from newDependencies
 	// This handles recreated parents whose old IDs might still be in newDependencies
@@ -277,10 +278,19 @@ func (dm *DependencyManager) handleMissingParents() {
 	for parentID, children := range dm.dependencies {
 		if !currentContainers[parentID] {
 			parentName := dm.getContainerName(parentID)
-			log.Printf("Parent container %s no longer exists, stopping its children", parentName)
-			dm.stopChildrenUnsafe(parentID, children, "parent no longer exists")
 			
-			// Store deleted parent info for potential recreation
+			// Check if this parent was already handled by handleRecreatedParents()
+			// If so, children were already recreated, don't stop them
+			if _, wasRecreated := dm.deletedParents[parentName]; wasRecreated {
+				log.Printf("Parent container %s is being recreated, children already handled", parentName)
+				continue
+			}
+			
+			// Parent truly deleted (not recreated) - stop children and store info
+			log.Printf("Parent container %s deleted (not recreated), stopping its children", parentName)
+			dm.stopChildrenUnsafe(parentID, children, "parent deleted")
+			
+			// Store deleted parent info for potential late recreation
 			dm.deletedParents[parentName] = DeletedParentInfo{
 				Name:      parentName,
 				Children:  append([]string{}, children...), // Make a copy
@@ -297,16 +307,8 @@ func (dm *DependencyManager) handleMissingParents() {
 			if !inspect.State.Running {
 				parentName := dm.getContainerName(parentID)
 				
-				// Check if this parent is in deletedParents (being recreated)
-				// Don't stop children if recreate is in progress
-				if _, isBeingRecreated := dm.deletedParents[parentName]; isBeingRecreated {
-					log.Printf("Parent container %s is stopped but being recreated, not stopping children",
-						parentName)
-					continue
-				}
-				
 				// Check if parent just stopped (within restart timeout)
-				// Don't stop children yet - let the timer decide if it's a rebuild or normal stop
+				// Don't stop children yet - let the timer decide if it's a restart or normal stop
 				if parentState, exists := dm.parentStates[parentID]; exists {
 					if !parentState.StoppedAt.IsZero() && time.Since(parentState.StoppedAt) < dm.restartTimeout {
 						log.Printf("Parent container %s stopped recently (%.2fs ago), waiting for timer to decide",
@@ -343,9 +345,8 @@ func (dm *DependencyManager) handleRecreatedParents() {
 		}
 	}
 	
-
-	
-	// Check for parents that no longer exist but might have been recreated with same name
+	// Check for parents that no longer exist but might have been recreated with the same name
+	// Collect all recreated parents first, then process them together
 	var parentsToRecreate []string
 	var childrenToRecreate [][]string
 	var parentNames []string
@@ -361,14 +362,21 @@ func (dm *DependencyManager) handleRecreatedParents() {
 		}
 		
 		if !parentExists {
-			// Parent doesn't exist, check if a container with the same name exists
-			oldParentName := dm.parentNames[parentID] // Use stored name instead of trying to get it from deleted container
+			// Parent no longer exists - check if container with same name exists (recreate scenario)
+			oldParentName := dm.parentNames[parentID] // Use stored name from before deletion
 			if oldParentName == "" {
-				oldParentName = dm.getContainerName(parentID) // Fallback to old method
+				oldParentName = dm.getContainerName(parentID) // Fallback if name wasn't stored
 			}
 			
 			if newParentID, found := currentContainersByName[oldParentName]; found {
 				log.Printf("Found recreated parent container: %s", oldParentName)
+				
+				// Mark in deletedParents so handleMissingParents won't stop children
+				dm.deletedParents[oldParentName] = DeletedParentInfo{
+					Name:      oldParentName,
+					Children:  append([]string{}, children...),
+					DeletedAt: time.Now(),
+				}
 				
 				parentsToRecreate = append(parentsToRecreate, newParentID)
 				childrenToRecreate = append(childrenToRecreate, children)
@@ -387,9 +395,9 @@ func (dm *DependencyManager) handleRecreatedParents() {
 		}
 	}
 	
-	// Also check deleted parents for recreation
+	// Also check deleted parents cache for late recreations
 	for parentName, deletedInfo := range dm.deletedParents {
-		// Clean up old entries (older than 30 seconds)
+		// Clean up stale entries (older than 30 seconds)
 		if time.Since(deletedInfo.DeletedAt) > 30*time.Second {
 			delete(dm.deletedParents, parentName)
 			continue
@@ -403,21 +411,19 @@ func (dm *DependencyManager) handleRecreatedParents() {
 			childrenToRecreate = append(childrenToRecreate, deletedInfo.Children)
 			parentNames = append(parentNames, parentName)
 			
-			// Remove from deleted cache
-			delete(dm.deletedParents, parentName)
+			// Keep in deleted cache during recreation so handleMissingParents knows it's being recreated
+			// Will be cleaned up after recreation is complete
 		}
 	}
 	
-
-	
-	// Recreate children for recreated parents
+	// Process all recreated parents - recreate their children
 	for i, newParentID := range parentsToRecreate {
 		children := childrenToRecreate[i]
 		parentName := parentNames[i]
 		
-		log.Printf("Recreating children for parent %s, waiting 2s before recreation...", parentName)
+		log.Printf("Recreating children for parent %s, waiting 2s before starting...", parentName)
 		
-		// Send notification about starting recreation
+		// Send notification about recreation start
 		var childNames []string
 		for _, oldChildID := range children {
 			if name, exists := dm.childNames[oldChildID]; exists {
@@ -430,15 +436,15 @@ func (dm *DependencyManager) handleRecreatedParents() {
 			dm.sendNotification("Docker", message, "normal")
 		}
 		
-		// Wait 2 seconds before starting recreation
+		// Wait 2 seconds before starting recreation (allows parent to fully initialize)
 		time.Sleep(2 * time.Second)
 		
-		// Initialize new parent state
+		// Initialize state for new parent container
 		dm.parentStates[newParentID] = &ContainerState{
 			WasRunning: false,
 		}
 		
-		// Recreate all children (regardless of autostart setting)
+		// Recreate all children (mos-deploy_docker will handle autostart logic)
 		var newChildren []string
 		for _, oldChildID := range children {
 			childName := dm.childNames[oldChildID]
@@ -450,10 +456,10 @@ func (dm *DependencyManager) handleRecreatedParents() {
 				continue
 			}
 			
-			// Wait for container to be created
+			// Wait for container to be created and initialized
 			time.Sleep(2 * time.Second)
 			
-			// Find new child container ID
+			// Find new child container ID by name
 			newChildID, err := dm.findContainerByName(childName)
 			if err != nil {
 				log.Printf("Failed to find recreated child container %s: %v", childName, err)
@@ -463,26 +469,22 @@ func (dm *DependencyManager) handleRecreatedParents() {
 			// Add to new dependencies
 			newChildren = append(newChildren, newChildID)
 			
-			// Transfer state to new child ID - preserve the original WasRunning state
+			// Transfer state to new child ID - PRESERVE the original WasRunning state
+			// DO NOT check running state after recreation - mos-deploy_docker needs the
+			// original state to decide whether to start the container or not
 			var wasRunning bool
 			if childState, exists := dm.childStates[oldChildID]; exists {
 				wasRunning = childState.WasRunning
 			}
 			
-			// Check actual running state after recreation (mos-deploy_docker handles start/stop)
-			inspect, err := dm.client.ContainerInspect(dm.ctx, newChildID)
-			if err == nil {
-				// Update WasRunning based on actual state after recreation
-				wasRunning = inspect.State.Running
-				log.Printf("Child container %s recreated, running state: %v", childName, wasRunning)
-			}
+			log.Printf("Child container %s recreated, preserving original WasRunning=%v", childName, wasRunning)
 			
 			dm.childStates[newChildID] = &ContainerState{
 				WasRunning: wasRunning,
 			}
 			dm.childNames[newChildID] = childName
 			
-			// Clean up old state
+			// Clean up old child state with old container ID
 			delete(dm.childStates, oldChildID)
 			delete(dm.childNames, oldChildID)
 		}
@@ -513,6 +515,9 @@ func (dm *DependencyManager) handleRecreatedParents() {
 				break
 			}
 		}
+		
+		// Clean up deletedParents after successful recreation
+		delete(dm.deletedParents, parentName)
 	}
 }
 
@@ -566,8 +571,8 @@ func (dm *DependencyManager) containerExists(containerID string) bool {
 }
 
 func (dm *DependencyManager) loadAutostartCache() {
-	// Always read fresh from file - no caching
-	// This ensures changes to autostart settings are immediately effective
+	// Always read fresh from file - no caching between calls
+	// This ensures changes to autostart settings take effect immediately
 	
 	// Read the single containers file
 	data, err := os.ReadFile(dm.containerConfigPath)
@@ -608,7 +613,7 @@ func (dm *DependencyManager) getContainerAutostart(containerName string) bool {
 		return false
 	}
 	
-	log.Printf("Container %s autostart setting: %v", cleanName, autostart)
+	log.Printf("Container %s has autostart=%v", cleanName, autostart)
 	return autostart
 }
 
@@ -629,15 +634,15 @@ func (dm *DependencyManager) handleContainerEvent(event events.Message) {
 	case "create":
 		// Rescan when new containers are created
 		go func() {
-			time.Sleep(1 * time.Second) // Small delay to ensure container is fully created
+			time.Sleep(1 * time.Second) // Wait for container to be fully initialized
 			if err := dm.scanContainers(); err != nil {
 				log.Printf("Error during rescan after create event: %v", err)
 			}
 		}()
 	case "destroy":
-		// Handle container deletion - might trigger recreation
+		// Handle container deletion - might trigger parent recreation
 		go func() {
-			time.Sleep(2 * time.Second) // Wait a bit longer for potential recreation
+			time.Sleep(2 * time.Second) // Wait longer to detect potential recreation
 			if err := dm.scanContainers(); err != nil {
 				log.Printf("Error during rescan after destroy event: %v", err)
 			}
@@ -659,13 +664,13 @@ func (dm *DependencyManager) handleContainerStart(containerID string) {
 			parentState.RestartTimer = nil
 		}
 
-		// Check if this is a restart (parent was stopped recently)
-		// StoppedAt is Zero-Time for new containers, so check that first
+		// Check if this is a restart (parent was stopped recently within timeout)
+		// StoppedAt is zero-time for brand new containers, check that first
 		isRestart := !parentState.StoppedAt.IsZero() &&
 		             time.Since(parentState.StoppedAt) <= dm.restartTimeout
 		
 		if isRestart {
-			// Quick restart - start children that were running before (WasRunning)
+			// Quick restart detected - start children that were running before
 			timeSinceStop := time.Since(parentState.StoppedAt)
 			log.Printf("Parent container %s restarted within timeout (%.2fs), waiting 2s before starting children that were running...",
 				dm.getContainerName(containerID), timeSinceStop.Seconds())
@@ -674,7 +679,7 @@ func (dm *DependencyManager) handleContainerStart(containerID string) {
 				dm.startChildrenForRestart(containerID, children)
 			}()
 		} else {
-			// Normal start (not a restart) - start children based on autostart setting
+			// Normal start (first time or after long stop) - use autostart setting
 			log.Printf("Parent container %s started (normal start), waiting 2s before starting children with autostart...",
 				dm.getContainerName(containerID))
 			go func() {
@@ -684,8 +689,8 @@ func (dm *DependencyManager) handleContainerStart(containerID string) {
 		}
 	}
 	
-	// Also check if this is a child container that was manually started
-	// Update WasRunning to true so it will restart with parent
+	// Check if this is a child container that was manually started
+	// Update WasRunning to true so it will auto-restart with parent
 	if childState, isChild := dm.childStates[containerID]; isChild {
 		log.Printf("Child container %s manually started, updating WasRunning to true",
 			dm.getContainerName(containerID))
@@ -702,13 +707,14 @@ func (dm *DependencyManager) handleContainerStop(containerID string) {
 		parentState := dm.parentStates[containerID]
 		parentState.StoppedAt = time.Now()
 		
-		log.Printf("Parent container %s stopped, waiting to determine if rebuild or normal stop...",
+		log.Printf("Parent container %s stopped, waiting to determine if restart or normal stop...",
 			dm.getContainerName(containerID))
 		
-		// DON'T stop children immediately - we need to check if this is a rebuild first
+		// DON'T stop children immediately - we need to check if this is a restart/recreate first
 		// Children will be stopped by either:
 		// 1. handleMissingParents (if parent deleted and no recreate)
-		// 2. Or stay running if parent is recreated (handleRecreatedParents)
+		// 2. This timer (if parent stopped but not restarted/recreated)
+		// 3. Or stay running if parent is restarted/recreated
 
 		// Set up restart timeout timer
 		if parentState.RestartTimer != nil {
@@ -729,7 +735,7 @@ func (dm *DependencyManager) handleContainerStop(containerID string) {
 			
 			// Timeout exceeded - check if parent still exists
 			if dm.containerExists(containerID) {
-				// Parent still exists but didn't restart - it's a normal stop
+				// Parent still exists but didn't restart - this is a normal stop
 				// Stop children now
 				if childrenIDs, exists := dm.dependencies[containerID]; exists {
 					log.Printf("Parent %s stopped normally (not restarted), stopping children now...",
@@ -737,17 +743,17 @@ func (dm *DependencyManager) handleContainerStop(containerID string) {
 					dm.stopChildrenUnsafe(containerID, childrenIDs, "parent stopped")
 				}
 			} else {
-				// Parent was deleted - handleMissingParents will handle it
-				log.Printf("Parent %s was deleted, handleMissingParents will handle children",
+				// Parent was deleted - handleMissingParents already handled it
+				log.Printf("Parent %s was deleted, handleMissingParents already handled children",
 					dm.getContainerName(containerID))
 			}
 		})
 	}
 	
-	// Also check if this is a child container that was manually stopped
+	// Check if this is a child container that was manually stopped
 	// Update WasRunning to false so it won't auto-restart with parent
 	if childState, isChild := dm.childStates[containerID]; isChild {
-		// Only update if it wasn't stopped by us (not in stoppedContainers map)
+		// Only update if it wasn't stopped by watchdog (not in stoppedContainers map)
 		if !dm.stoppedContainers[containerID] {
 			log.Printf("Child container %s manually stopped, updating WasRunning to false",
 				dm.getContainerName(containerID))
@@ -758,6 +764,7 @@ func (dm *DependencyManager) handleContainerStop(containerID string) {
 
 func (dm *DependencyManager) stopChildrenUnsafe(parentID string, children []string, reason string) {
 	// Collect containers to stop and update their states first
+	// Note: caller must hold mutex lock
 	var containersToStop []string
 	var containerNames []string
 	
@@ -770,15 +777,15 @@ func (dm *DependencyManager) stopChildrenUnsafe(parentID string, children []stri
 
 		childName := dm.getContainerName(childID)
 		
-		// Store current state for potential future restart
-		// Only update WasRunning if the container is actually running
-		// Don't overwrite with false if it was running before
+		// Store current running state for potential future restart
+		// Only update WasRunning to true if container is actually running
+		// Never overwrite with false - preserve the original state
 		if childState, exists := dm.childStates[childID]; exists {
 			if inspect.State.Running {
 				childState.WasRunning = true
 			}
 		} else {
-			// Create new state if it doesn't exist
+			// Create new state if it doesn't exist yet
 			dm.childStates[childID] = &ContainerState{
 				WasRunning: inspect.State.Running,
 			}
@@ -790,7 +797,7 @@ func (dm *DependencyManager) stopChildrenUnsafe(parentID string, children []stri
 			containersToStop = append(containersToStop, childID)
 			containerNames = append(containerNames, childName)
 		} else if !dm.stoppedContainers[childID] {
-			log.Printf("Child container %s was already stopped", childName)
+			log.Printf("Child container %s is already stopped", childName)
 		}
 	}
 	
@@ -805,19 +812,19 @@ func (dm *DependencyManager) stopChildrenUnsafe(parentID string, children []stri
 	message := dm.formatContainerMessage("Stopping", containerNames, parentName)
 	dm.sendNotification("Docker", message, "normal")
 	
-	// Stop all containers asynchronously
+	// Stop all containers asynchronously (parallel stops for faster execution)
 	for i, childID := range containersToStop {
 		childName := containerNames[i]
 		go func(id, name string) {
 			log.Printf("Stopping child container %s (%s)", name, reason)
-			timeout := int(10) // 10 seconds timeout for stopping
+			timeout := int(10) // 10 second timeout for graceful stop
 			if err := dm.client.ContainerStop(dm.ctx, id, container.StopOptions{Timeout: &timeout}); err != nil {
 				log.Printf("Error stopping child container %s: %v", name, err)
 			} else {
 				log.Printf("Successfully stopped child container %s", name)
 			}
 			
-			// Clean up after 5 seconds
+			// Clean up stopped containers tracking after 5 seconds
 			time.Sleep(5 * time.Second)
 			dm.mutex.Lock()
 			delete(dm.stoppedContainers, id)
@@ -832,12 +839,13 @@ func (dm *DependencyManager) recreateContainer(containerName string) error {
 	templateFile := fmt.Sprintf("%s.json", containerName)
 	templatePath := fmt.Sprintf("%s%s", dm.templatesPath, templateFile)
 	
-	// Check if template exists
+	// Check if template file exists
 	if _, err := os.Stat(templatePath); os.IsNotExist(err) {
 		return fmt.Errorf("template file not found: %s", templatePath)
 	}
 	
-	// Change to templates directory and execute mos-deploy_docker with full path
+	// Execute mos-deploy_docker from templates directory
+	// mos-deploy_docker handles stopping, removing, creating, and starting based on original state
 	cmd := exec.CommandContext(dm.ctx, "/usr/local/bin/mos-deploy_docker", templateFile, "recreate_container")
 	cmd.Dir = dm.templatesPath
 	output, err := cmd.CombinedOutput()
@@ -852,9 +860,9 @@ func (dm *DependencyManager) recreateContainer(containerName string) error {
 }
 
 func (dm *DependencyManager) startChildrenForRestart(parentID string, children []string) {
-	// For restart: restart containers that were running before (WasRunning = true)
-	// Autostart is IGNORED during restart
-	// Use docker restart instead of stop+start to avoid race conditions
+	// For parent restart: restart children that were running before (WasRunning = true)
+	// Autostart setting is IGNORED during restart - only WasRunning matters
+	// Use docker restart command instead of stop+start to avoid race conditions
 	
 	dm.mutex.Lock()
 	defer dm.mutex.Unlock()
@@ -905,8 +913,8 @@ func (dm *DependencyManager) startChildrenForRestart(parentID string, children [
 }
 
 func (dm *DependencyManager) startChildrenForNormalStart(parentID string, children []string) {
-	// For normal start: start containers based on autostart setting
-	// WasRunning is IGNORED during normal start
+	// For parent normal start (not a restart): start children based on autostart setting only
+	// WasRunning state is IGNORED during normal start - only autostart matters
 	
 	dm.mutex.Lock()
 	defer dm.mutex.Unlock()
@@ -962,118 +970,6 @@ func (dm *DependencyManager) startChildrenForNormalStart(parentID string, childr
 				log.Printf("Successfully started child container %s", name)
 			}
 		}(childID, childName)
-	}
-}
-
-func (dm *DependencyManager) startChildrenForRecreation(parentID string, children []string) {
-	// For recreation: check if containers exist, recreate if needed, then start
-	currentContainers := make(map[string]bool)
-	
-	// Get current MOS container list to check which ones still exist
-	containers, err := dm.client.ContainerList(dm.ctx, container.ListOptions{
-		All:     true,
-		Filters: dm.getMOSContainerFilter(),
-	})
-	if err != nil {
-		log.Printf("Error listing containers: %v", err)
-		return
-	}
-	
-	for _, c := range containers {
-		currentContainers[c.ID] = true
-	}
-	
-	for _, childID := range children {
-		childName := dm.getContainerName(childID)
-		
-		// Check autostart setting
-		if !dm.getContainerAutostart(childName) {
-			log.Printf("Child container %s has autostart disabled, keeping it stopped", childName)
-			continue
-		}
-		
-		childState, exists := dm.childStates[childID]
-		if !exists {
-			log.Printf("DEBUG: No state found for child %s in recreation, keeping it stopped", childName)
-			continue
-		}
-		
-		log.Printf("DEBUG: Child %s recreation state: WasRunning=%v", childName, childState.WasRunning)
-		
-		if !childState.WasRunning {
-			log.Printf("Child container %s was not running before, keeping it stopped", childName)
-			continue
-		}
-		
-		// Check if container still exists
-		if !currentContainers[childID] {
-			// Container doesn't exist, try to recreate it
-			if containerName, nameExists := dm.childNames[childID]; nameExists {
-				log.Printf("Child container %s no longer exists, attempting to recreate...", containerName)
-				
-				if err := dm.recreateContainer(containerName); err != nil {
-					log.Printf("Failed to recreate container %s: %v", containerName, err)
-					continue
-				}
-				
-				// Wait a moment for container to be created
-				time.Sleep(2 * time.Second)
-				
-				// Find the new container ID
-				newChildID, err := dm.findContainerByName(containerName)
-				if err != nil {
-					log.Printf("Failed to find recreated container %s: %v", containerName, err)
-					continue
-				}
-				
-				// Update the dependency mapping
-				dm.updateChildID(childID, newChildID)
-				childID = newChildID
-			} else {
-				log.Printf("Child container %s no longer exists and name unknown, skipping", childID)
-				continue
-			}
-		}
-
-		// Check if child is already running
-		inspect, err := dm.client.ContainerInspect(dm.ctx, childID)
-		if err != nil {
-			log.Printf("Error inspecting child container %s: %v", childID, err)
-			continue
-		}
-
-		if inspect.State.Running {
-			log.Printf("Child container %s is already running", childName)
-			continue
-		}
-
-		log.Printf("Starting child container %s", childName)
-		if err := dm.client.ContainerStart(dm.ctx, childID, container.StartOptions{}); err != nil {
-			log.Printf("Error starting child container %s: %v", childName, err)
-		}
-	}
-}
-
-func (dm *DependencyManager) updateChildID(oldID, newID string) {
-	// Update dependencies
-	for parentID, children := range dm.dependencies {
-		for i, childID := range children {
-			if childID == oldID {
-				dm.dependencies[parentID][i] = newID
-			}
-		}
-	}
-	
-	// Transfer state
-	if state, exists := dm.childStates[oldID]; exists {
-		dm.childStates[newID] = state
-		delete(dm.childStates, oldID)
-	}
-	
-	// Transfer name
-	if name, exists := dm.childNames[oldID]; exists {
-		dm.childNames[newID] = name
-		delete(dm.childNames, oldID)
 	}
 }
 
