@@ -12,19 +12,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
         go-version: '1.24.6'
-    
+
     - name: Execute GO tidy
       run: go mod tidy
-    
-    - name: Build image-sha and create .deb package
+
+    - name: Build image-sha and create .deb package for amd64
       run: |
         BUILDDIR=${{ github.workspace }}
         PACKAGEDIR=$BUILDDIR/docker-watchdog_package
@@ -50,38 +52,47 @@ jobs:
         chmod -R 755 $PACKAGEDIR
         dpkg-deb --build docker-watchdog_package mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb
         md5sum $BUILDDIR/mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb | awk '{print $1}' > $BUILDDIR/mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb.md5
-    
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build image-sha and create .deb package for arm64
+      run: |
+        BUILDDIR=${{ github.workspace }}
+        PACKAGEDIR=$BUILDDIR/docker-watchdog_package
+        rm -rf $BUILDDIR/docker-watchdog $PACKAGEDIR
+        mkdir -p $PACKAGEDIR/DEBIAN $PACKAGEDIR/usr/bin $PACKAGEDIR/usr/share/doc/mos-docker-watchdog
+
+        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o docker-watchdog
+
+        mv $BUILDDIR/docker-watchdog $PACKAGEDIR/usr/bin/docker-watchdog
+
+        # Add LICENSE from repo:
+        cp "${{ github.workspace }}/LICENSE" "$PACKAGEDIR/usr/share/doc/mos-docker-watchdog/LICENSE"
+        echo -e "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: MOS\nSource: https://github.com/ich777/mos-docker-watchdog\n\nFiles: *\nCopyright: 2025 Christoph Hummer\nLicense: GPL-2.0" >> $PACKAGEDIR/usr/share/doc/mos-docker-watchdog/copyright
+
+        cat > $PACKAGEDIR/DEBIAN/control << EOF
+        Package: docker-watchdog
+        Version: ${{ github.event.inputs.version }}-mos
+        Architecture: arm64
+        Maintainer: admin@minenet.at
+        Description: docker-watchdog for MOS
+        EOF
+
+        cd $BUILDDIR
+        chmod -R 755 $PACKAGEDIR
+        dpkg-deb --build docker-watchdog_package mos-docker-watchdog_${{ github.event.inputs.version }}_arm64.deb
+        md5sum $BUILDDIR/mos-docker-watchdog_${{ github.event.inputs.version }}_arm64.deb | awk '{print $1}' > $BUILDDIR/mos-docker-watchdog_${{ github.event.inputs.version }}_arm64.deb.md5
+
+    - name: Create and Upload Release
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: v${{ github.event.inputs.version }}
-        release_name: "docker-watchdog v${{ github.event.inputs.version }}"
+        name: "docker-watchdog v${{ github.event.inputs.version }}"
         body: docker-watchdog for MOS
-        draft: false
-        prerelease: false
-
-    - name: Upload Release
-      uses: actions/upload-release-asset@v1
+        files: |
+          ${{ github.workspace }}/mos-docker-watchdog*
+        overwrite_files: true
+        fail_on_unmatched_files: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb
-        asset_name: mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb
-        asset_content_type: application/octet-stream
-
-    - name: Upload md5 to Release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb.md5
-        asset_name: mos-docker-watchdog_${{ github.event.inputs.version }}_amd64.deb.md5
-        asset_content_type: text/plain
 
     - name: Cleanup
       if: always()
